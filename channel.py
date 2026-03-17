@@ -1069,7 +1069,7 @@ class OneBotChannel(BaseChannel):
                 if url:
                     parts.append(ImageContent(
                         type=ContentType.IMAGE,
-                        image_url={"url": url},
+                        image_url=url,
                     ))
 
             elif seg_type == "at":

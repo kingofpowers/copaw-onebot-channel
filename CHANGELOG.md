@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.2] - 2026-03-17
+
+### Fixed
+
+- **图片消息处理错误**
+  - 问题：`ImageContent.image_url` 传入 `{"url": url}` 导致验证失败
+  - 原因：`image_url` 字段期望字符串，而不是 dict
+  - 解决：直接传入 `url` 字符串
+
 ## [0.4.1] - 2026-03-17
 
 ### Changed
