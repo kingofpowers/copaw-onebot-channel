@@ -19,14 +19,18 @@ import argparse
 import asyncio
 import aiohttp
 import json
+import os
 import re
 import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict
 
-# 配置文件路径
-AGENT_CONFIG_PATH = Path("/root/.copaw/workspaces/default/agent.json")
+# 配置文件路径（支持环境变量覆盖）
+AGENT_CONFIG_PATH = Path(
+    os.environ.get("AGENT_CONFIG_PATH") or 
+    os.environ.get("COPILOT_WORKSPACE", "/root/.copaw/workspaces/default") + "/agent.json"
+)
 
 # 缓存: instance_name -> bot_qq
 _bot_qq_cache: Dict[str, int] = {}
