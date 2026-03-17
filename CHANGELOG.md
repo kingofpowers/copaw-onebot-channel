@@ -16,6 +16,22 @@
   - 支持指定 instance + group_id
   - 鉴权通过 `get_login_info` API 自动获取 bot QQ 号
 
+### Fixed (CoPaw 集成问题)
+
+- **custom_channels 路径错误**
+  - 问题：代码放在 `~/.copaw/custom_channels/` 未生效
+  - 原因：CoPaw 从 `/app/working/custom_channels/` 加载
+  - 解决：代码放到正确路径
+
+- **RunStatus 导入错误**
+  - 问题：`ModuleNotFoundError: No module named 'agentscope_runtime.engine.schemas.run'`
+  - 解决：正确导入路径 `from agentscope_runtime.engine.schemas.agent_schemas import RunStatus`
+
+- **配置文件不一致**
+  - 问题：`config.json` 中的配置与实际运行不符
+  - 原因：Channel 配置存储在 `agent.json`，`config.json` 是遗留/备用配置
+  - 解决：清理 `config.json` 中的过时 onebot 配置，使用 `agent.json` 管理
+
 ## [0.4.0] - 2026-03-16
 
 ### Added
