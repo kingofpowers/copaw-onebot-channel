@@ -53,6 +53,20 @@ user_id:    "100399943"  (发送者 QQ 号)
 2. **实例匹配**：调用 `get_login_info` API 获取 bot QQ 号，匹配 session_id
 3. **无需手动配置**：QQ 号在运行时自动获取
 
+### 配置路径
+
+脚本通过环境变量定位配置文件：
+
+```bash
+# 方式 1: 设置完整配置路径
+export AGENT_CONFIG_PATH=/path/to/agent.json
+
+# 方式 2: 设置 workspace 目录
+export COPILOT_WORKSPACE=/path/to/workspace
+
+# 默认: /root/.copaw/workspaces/default/agent.json
+```
+
 ## 输出格式
 
 ### JSON 格式（--raw）
