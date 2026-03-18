@@ -10,6 +10,8 @@ OneBot 11 协议 Channel 实现，用于 CoPaw 接入 QQ 机器人（NapCatQQ）
 - ✅ 多 Agent 路由
 - ✅ 图片、文件等富媒体支持
 - ✅ 群历史消息获取（Skill）
+- ✅ Emoji 消息类型标记（思考/工具/跳过）
+- ✅ Bot 消息过滤（防止自循环）
 
 ## 安装
 
@@ -27,6 +29,9 @@ cp -r onebot /app/working/custom_channels/
   "channels": {
     "onebot": {
       "enabled": true,
+      "thinking_emoji": "🤔",
+      "tool_emoji": "📝",
+      "skip_emoji": "💤",
       "instances": [
         {
           "name": "napcat",
@@ -55,6 +60,9 @@ cp -r onebot /app/working/custom_channels/
 
 | 字段 | 说明 |
 |------|------|
+| `thinking_emoji` | 思考内容标记（默认 🤔）|
+| `tool_emoji` | 工具调用标记（默认 📝）|
+| `skip_emoji` | 无意义内容标记（默认 💤）|
 | `instances` | 机器人实例列表 |
 | `instances[].name` | 实例名（用于标识）|
 | `instances[].ws_url` | WebSocket 地址 |
@@ -63,6 +71,8 @@ cp -r onebot /app/working/custom_channels/
 | `instances[].group_mention_policy` | 分群的 @ 策略覆盖 |
 | `routing_rules` | 消息路由规则 |
 | `default_agent` | 默认 Agent |
+
+> **Emoji 说明**：实例级别可覆盖顶层配置。这些标记用于下游 channel 过滤，不由 Bot 控制。
 
 ## Session ID 格式
 
@@ -109,6 +119,12 @@ python3 skills/onebot_history/onebot_history.py --group-id 549149294 --instance 
 | raw_message | 完整 OneBot 消息 |
 
 ## 版本历史
+
+### v0.5.0
+
+- 顶层 Emoji 配置（thinking/tool/skip）
+- Bot 消息过滤（防止自循环）
+- TextContent 处理修复
 
 ### v0.4.1
 

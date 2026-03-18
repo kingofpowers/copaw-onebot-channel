@@ -49,9 +49,21 @@ CHANNEL_TYPE_ONEBOT: ChannelType = "onebot"
 # Media directory for received files
 DEFAULT_MEDIA_DIR = WORKING_DIR / "media" / "onebot"
 
+# Global message deduplication cache (shared across all OneBotChannel instances)
+# Key: "bot_id:message_type:group_or_user_id:message_id"
+_GLOBAL_PROCESSED_MESSAGES: set = set()
+_MAX_DEDUP_CACHE_SIZE = 2000
+
 # Global registry for active OneBot channels (by bot QQ number)
 # This allows tools to access the channel without knowing tokens
 _active_channels: Dict[int, "OneBotChannel"] = {}
+
+# Global connection manager - shared across all OneBotChannel instances
+# This ensures only one WebSocket connection per NapCat instance
+# Key: instance name (e.g., "napcat", "napcat2")
+_global_connections: Dict[str, Dict[str, Any]] = {}
+_global_connection_lock = asyncio.Lock()
+_global_connection_refs: Dict[str, int] = {}  # Reference count per instance
 _pending_api_calls: Dict[str, asyncio.Future] = {}
 _api_call_counter = 0
 _api_call_lock = asyncio.Lock()
@@ -80,6 +92,12 @@ class OneBotInstance:
     # Overrides require_mention for specific groups
     # Example: {"123456": false, "789012": true}
     group_mention_policy: Dict[int, bool] = field(default_factory=dict)
+    
+    # Content type emoji markers (prepended to content for identification)
+    # These are just markers, not filters. Sending is controlled by filter config.
+    thinking_emoji: str = "🤔"  # Thinking/reasoning content
+    tool_emoji: str = "📝"     # Tool call/result content
+    skip_emoji: str = "💤"     # Bot can use this to mark meaningless content
 
     # Runtime state
     self_id: int = 0
@@ -146,6 +164,10 @@ class OneBotChannel(BaseChannel):
         deny_message: str = "",
         require_mention: bool = False,
         output_options: Optional[Dict[str, Any]] = None,
+        # Top-level emoji config (can be overridden per-instance)
+        thinking_emoji: str = "🤔",
+        tool_emoji: str = "📝",
+        skip_emoji: str = "💤",
     ):
         super().__init__(
             process=process,
@@ -165,6 +187,11 @@ class OneBotChannel(BaseChannel):
         self._default_agent = default_agent or "default"
         self._media_dir = Path(media_dir) if media_dir else DEFAULT_MEDIA_DIR
         self._media_dir.mkdir(parents=True, exist_ok=True)
+
+        # Store top-level emoji config
+        self._thinking_emoji = thinking_emoji
+        self._tool_emoji = tool_emoji
+        self._skip_emoji = skip_emoji
 
         # Parse output options
         self._output_options = self._parse_output_options(output_options)
@@ -187,6 +214,10 @@ class OneBotChannel(BaseChannel):
                     qq_id=inst_cfg.get("qq_id", 0),
                     require_mention=inst_cfg.get("require_mention", True),
                     group_mention_policy=group_mention_policy,
+                    # Use instance-specific emoji or fall back to top-level
+                    thinking_emoji=inst_cfg.get("thinking_emoji", thinking_emoji),
+                    tool_emoji=inst_cfg.get("tool_emoji", tool_emoji),
+                    skip_emoji=inst_cfg.get("skip_emoji", skip_emoji),
                 )
                 if inst.ws_url:
                     self._instances[inst.name] = inst
@@ -296,6 +327,10 @@ class OneBotChannel(BaseChannel):
             deny_message=get_val("deny_message", "") or "",
             require_mention=bool(get_val("require_mention", False)),
             output_options=get_val("output_options"),
+            # Top-level emoji config
+            thinking_emoji=get_val("thinking_emoji", "🤔") or "🤔",
+            tool_emoji=get_val("tool_emoji", "📝") or "📝",
+            skip_emoji=get_val("skip_emoji", "💤") or "💤",
         )
 
     @property
@@ -533,10 +568,16 @@ class OneBotChannel(BaseChannel):
 
         # Run the process loop with selected process
         last_response = None
+        event_count = 0
         try:
             async for event in process(request):
+                event_count += 1
                 obj = getattr(event, "object", None)
                 status = getattr(event, "status", None)
+                msg_type = getattr(event, "type", None)
+                logger.info(
+                    f"OneBot: event #{event_count}, obj={obj}, status={status}, type={msg_type}"
+                )
                 if obj == "message" and status == RunStatus.Completed:
                     await self.on_event_message_completed(
                         request,
@@ -590,15 +631,41 @@ class OneBotChannel(BaseChannel):
         from agentscope_runtime.engine.schemas.agent_schemas import MessageType
         msg_type = getattr(event, "type", None)
         
-        # Filter thinking/reasoning content
+        # Debug: log event structure
+        logger.info(
+            f"OneBot: on_event_message_completed, msg_type={msg_type}, "
+            f"output_opts={output_opts}, event.content type={type(getattr(event, 'content', None))}"
+        )
+        
+        # Get emoji markers from instance config (with top-level fallback)
+        parsed = self._parse_to_handle(to_handle)
+        bot_qq = parsed.get("instance", "")
+        inst = None
+        for i in self._instances.values():
+            if str(i.self_id) == bot_qq or i.name == bot_qq:
+                inst = i
+                break
+        
+        # Use instance-specific emoji or fall back to top-level config
+        thinking_emoji = inst.thinking_emoji if inst else self._thinking_emoji
+        tool_emoji = inst.tool_emoji if inst else self._tool_emoji
+        
+        # Filter thinking/reasoning content: add emoji marker when showing
         if msg_type == MessageType.REASONING:
-            if not output_opts.get("show_thinking", False):
+            if output_opts.get("show_thinking", False):
+                # Add thinking emoji to mark this as internal thinking
+                logger.info(
+                    f"OneBot: marking thinking message with {thinking_emoji} for agent '{target_agent}'"
+                )
+                event = self._prepend_emoji_to_event(event, thinking_emoji)
+            else:
+                # Not showing thinking, skip this message
                 logger.debug(
-                    f"OneBot: filtering thinking message for agent '{target_agent}'"
+                    f"OneBot: skipping thinking message for agent '{target_agent}' (show_thinking=False)"
                 )
                 return
         
-        # Filter tool calls
+        # Filter tool calls: add emoji marker when showing
         if msg_type in (
             MessageType.FUNCTION_CALL,
             MessageType.PLUGIN_CALL,
@@ -607,9 +674,16 @@ class OneBotChannel(BaseChannel):
             MessageType.PLUGIN_CALL_OUTPUT,
             MessageType.MCP_TOOL_CALL_OUTPUT,
         ):
-            if not output_opts.get("show_tool_calls", False):
+            if output_opts.get("show_tool_calls", False):
+                # Add tool emoji to mark this as tool content
+                logger.info(
+                    f"OneBot: marking tool message with {tool_emoji} for agent '{target_agent}'"
+                )
+                event = self._prepend_emoji_to_event(event, tool_emoji)
+            else:
+                # Not showing tool calls, skip this message
                 logger.debug(
-                    f"OneBot: filtering tool call message for agent '{target_agent}'"
+                    f"OneBot: skipping tool message for agent '{target_agent}' (show_tool_calls=False)"
                 )
                 return
         
@@ -623,6 +697,47 @@ class OneBotChannel(BaseChannel):
         
         # Use base class method to send message
         await self.send_message_content(to_handle, event, send_meta)
+
+    def _prepend_emoji_to_event(self, event: Any, emoji: str) -> Any:
+        """Prepend an emoji to event content.
+        
+        Args:
+            event: The event object
+            emoji: Emoji to prepend
+            
+        Returns:
+            Modified event with emoji prepended to content
+        """
+        # Get content from event
+        content = getattr(event, "content", None)
+        if content is None:
+            logger.warning(f"OneBot: _prepend_emoji_to_event - content is None")
+            return event
+        
+        # Handle different content types
+        if isinstance(content, str):
+            # Simple string content
+            new_content = f"{emoji} {content}"
+            setattr(event, "content", new_content)
+        elif isinstance(content, list):
+            # List of content blocks (could be dict or TextContent objects)
+            for block in content:
+                # Handle dict format
+                if isinstance(block, dict) and block.get("type") == "text":
+                    original_text = block.get("text", "")
+                    block["text"] = f"{emoji} {original_text}"
+                    break
+                # Handle TextContent object
+                elif hasattr(block, "type") and getattr(block, "type", None) == "text":
+                    original_text = getattr(block, "text", "")
+                    if original_text:
+                        setattr(block, "text", f"{emoji} {original_text}")
+                        break
+            else:
+                # No text block found, prepend as new dict block
+                content.insert(0, {"type": "text", "text": emoji})
+        
+        return event
 
     def merge_native_items(self, items: List[Any]) -> Any:
         """Merge multiple native payloads from same session."""
@@ -701,8 +816,14 @@ class OneBotChannel(BaseChannel):
         return self._default_agent
 
     async def start(self) -> None:
-        """Start all WebSocket connections."""
-        global _active_channels
+        """Start WebSocket connections (singleton pattern).
+        
+        Multiple OneBotChannel instances (one per agent) share the same WebSocket
+        connections. Only the first instance to call start() actually establishes
+        connections; subsequent instances reuse them.
+        """
+        global _active_channels, _global_connections, _global_connection_refs, _global_connection_lock
+        
         if not self._enabled:
             logger.info("OneBot channel is disabled")
             return
@@ -712,42 +833,98 @@ class OneBotChannel(BaseChannel):
             return
 
         self._running = True
-        self._http = aiohttp.ClientSession()
-
-        # Start connection tasks for each instance
-        for inst in self._instances.values():
-            if inst.enabled:
-                asyncio.create_task(self._connect_instance(inst))
-                # Register to global registry (will be updated with self_id after connection)
-                # Use instance name as placeholder, will be updated when self_id is known
+        
+        async with _global_connection_lock:
+            if self._http is None:
+                self._http = aiohttp.ClientSession()
+            
+            # Start connections for each instance (if not already connected)
+            for inst in self._instances.values():
+                if not inst.enabled:
+                    continue
+                    
+                inst_name = inst.name
+                
+                # Check if already connected globally
+                if inst_name in _global_connections:
+                    # Reuse existing connection (or pending connection)
+                    global_conn = _global_connections[inst_name]
+                    if global_conn.get("pending"):
+                        # Connection is being established, just increment ref count
+                        _global_connection_refs[inst_name] = _global_connection_refs.get(inst_name, 0) + 1
+                        logger.info(f"OneBot {inst_name}: waiting for pending connection (refs={_global_connection_refs[inst_name]})")
+                    else:
+                        # Connection already established, reuse it
+                        inst.ws = global_conn["ws"]
+                        inst.session = global_conn["session"]
+                        inst.self_id = global_conn["self_id"]
+                        inst.nickname = global_conn["nickname"]
+                        inst.heartbeat_task = global_conn["heartbeat_task"]
+                        inst.receive_task = global_conn["receive_task"]
+                        _global_connection_refs[inst_name] = _global_connection_refs.get(inst_name, 0) + 1
+                        logger.info(f"OneBot {inst_name}: reusing existing connection (refs={_global_connection_refs[inst_name]})")
+                else:
+                    # Create placeholder to prevent race condition
+                    _global_connections[inst_name] = {"pending": True}
+                    _global_connection_refs[inst_name] = 1
+                    asyncio.create_task(self._connect_instance_shared(inst))
+                    logger.info(f"OneBot {inst_name}: creating new connection")
 
         logger.info(f"OneBot channel started with {len(self._instances)} instance(s)")
 
     async def stop(self) -> None:
-        """Stop all WebSocket connections."""
-        global _active_channels
+        """Stop WebSocket connections (reference counted).
+        
+        Only closes connections when the last instance calls stop().
+        """
+        global _active_channels, _global_connections, _global_connection_refs, _global_connection_lock
+        
         self._running = False
-
-        # Unregister from global registry
-        for inst in self._instances.values():
-            if inst.self_id and inst.self_id in _active_channels:
-                del _active_channels[inst.self_id]
-            if inst.heartbeat_task:
-                inst.heartbeat_task.cancel()
-            if inst.receive_task:
-                inst.receive_task.cancel()
-            if inst.ws and not inst.ws.closed:
-                await inst.ws.close()
-            if inst.session and not inst.session.closed:
-                await inst.session.close()
+        
+        async with _global_connection_lock:
+            for inst in self._instances.values():
+                inst_name = inst.name
+                
+                if inst_name not in _global_connection_refs:
+                    continue
+                    
+                _global_connection_refs[inst_name] -= 1
+                
+                if _global_connection_refs[inst_name] <= 0:
+                    # Last reference, close connection
+                    logger.info(f"OneBot {inst_name}: last reference, closing connection")
+                    
+                    # Unregister from global registry
+                    if inst.self_id and inst.self_id in _active_channels:
+                        del _active_channels[inst.self_id]
+                    
+                    if inst.heartbeat_task:
+                        inst.heartbeat_task.cancel()
+                    if inst.receive_task:
+                        inst.receive_task.cancel()
+                    if inst.ws and not inst.ws.closed:
+                        await inst.ws.close()
+                    if inst.session and not inst.session.closed:
+                        await inst.session.close()
+                    
+                    # Clean up global state
+                    if inst_name in _global_connections:
+                        del _global_connections[inst_name]
+                    if inst_name in _global_connection_refs:
+                        del _global_connection_refs[inst_name]
+                else:
+                    logger.info(f"OneBot {inst_name}: connection kept (refs={_global_connection_refs[inst_name]})")
 
         if self._http and not self._http.closed:
             await self._http.close()
+            self._http = None
 
         logger.info("OneBot channel stopped")
 
-    async def _connect_instance(self, inst: OneBotInstance) -> None:
-        """Connect to a single OneBot instance with reconnection."""
+    async def _connect_instance_shared(self, inst: OneBotInstance) -> None:
+        """Connect to a single OneBot instance and update global state."""
+        global _active_channels, _global_connections, _global_connection_lock
+        
         reconnect_idx = 0
 
         while self._running:
@@ -773,6 +950,17 @@ class OneBotChannel(BaseChannel):
                     inst.last_heartbeat_ack = time.time()
 
                     logger.info(f"OneBot {inst.name} connected")
+
+                    # Update global connection state
+                    async with _global_connection_lock:
+                        _global_connections[inst.name] = {
+                            "ws": ws,
+                            "session": inst.session,
+                            "self_id": 0,
+                            "nickname": "",
+                            "heartbeat_task": None,
+                            "receive_task": None,
+                        }
 
                     # Request login info
                     await ws.send_json({
@@ -892,7 +1080,7 @@ class OneBotChannel(BaseChannel):
         data: Dict[str, Any],
     ) -> None:
         """Handle API response."""
-        global _active_channels
+        global _active_channels, _global_connections
         echo = data.get("echo", "")
         status = data.get("status", "")
         retcode = data.get("retcode", -1)
@@ -910,6 +1098,12 @@ class OneBotChannel(BaseChannel):
                 info = data.get("data", {})
                 inst.self_id = info.get("user_id", 0)
                 inst.nickname = info.get("nickname", "")
+                
+                # Update global connection state
+                if inst.name in _global_connections:
+                    _global_connections[inst.name]["self_id"] = inst.self_id
+                    _global_connections[inst.name]["nickname"] = inst.nickname
+                
                 # Register to global registry for API calls
                 if inst.self_id:
                     _active_channels[inst.self_id] = self
@@ -934,12 +1128,16 @@ class OneBotChannel(BaseChannel):
         data: Dict[str, Any],
     ) -> None:
         """Handle meta events (connect, heartbeat)."""
+        global _global_connections
         meta_event_type = data.get("meta_event_type", "")
 
         if meta_event_type == "lifecycle":
             sub_type = data.get("sub_type", "")
             if sub_type == "connect":
                 inst.self_id = data.get("self_id", 0)
+                # Update global connection state
+                if inst.name in _global_connections:
+                    _global_connections[inst.name]["self_id"] = inst.self_id
                 logger.info(f"OneBot {inst.name} lifecycle: connect (self_id={inst.self_id})")
 
         elif meta_event_type == "heartbeat":
@@ -952,11 +1150,76 @@ class OneBotChannel(BaseChannel):
         data: Dict[str, Any],
     ) -> None:
         """Handle chat message and enqueue for processing."""
+        global _GLOBAL_PROCESSED_MESSAGES
+        
         message_type = data.get("message_type", "private")
         user_id = data.get("user_id", 0)
         group_id = data.get("group_id", 0)
         message = data.get("message", [])
         self_id = data.get("self_id", 0)
+        message_id = data.get("message_id", 0)
+        
+        # Message deduplication using GLOBAL cache
+        # This handles the case where multiple channel instances (one per agent)
+        # receive the same message from the same bot
+        if message_id:
+            bot_id = inst.self_id or self_id
+            dedup_key = f"{bot_id}:{message_type}:{group_id if message_type == 'group' else user_id}:{message_id}"
+            
+            if dedup_key in _GLOBAL_PROCESSED_MESSAGES:
+                logger.info(
+                    f"OneBot {inst.name}: skipping duplicate message (global dedup), "
+                    f"message_id={message_id}, bot={bot_id}"
+                )
+                return
+            
+            # Add to global cache
+            _GLOBAL_PROCESSED_MESSAGES.add(dedup_key)
+            logger.debug(f"OneBot {inst.name}: added to global dedup cache, key={dedup_key}")
+            
+            # Prevent memory leak: trim cache if too large
+            if len(_GLOBAL_PROCESSED_MESSAGES) > _MAX_DEDUP_CACHE_SIZE:
+                # Keep only the most recent entries
+                _GLOBAL_PROCESSED_MESSAGES = set(list(_GLOBAL_PROCESSED_MESSAGES)[-_MAX_DEDUP_CACHE_SIZE // 2:])
+
+        # Debug: log raw message data
+        logger.info(
+            f"OneBot {inst.name}: processing message_id={message_id}, "
+            f"group={group_id}, user={user_id}, bot={inst.self_id or self_id}"
+        )
+        
+        # Filter messages from bots (including self)
+        # Rule 0: Ignore messages sent by any bot (user_id matches any known bot)
+        if user_id and inst.self_id:
+            # Check if sender is self (this bot)
+            if user_id == inst.self_id:
+                logger.info(
+                    f"OneBot {inst.name}: ignoring self-sent message, "
+                    f"user={user_id}, bot={inst.self_id}"
+                )
+                return
+            # Check if sender is another bot in the same group
+            # by checking if message starts with any bot emoji markers
+            first_text = self._extract_first_text(message)
+            if first_text:
+                # Collect bot emojis: top-level + instance-specific overrides
+                bot_emojis = {
+                    self._thinking_emoji,
+                    self._tool_emoji,
+                    self._skip_emoji,
+                }
+                # Add instance-specific emojis (may have custom config)
+                for i in self._instances.values():
+                    bot_emojis.add(i.thinking_emoji)
+                    bot_emojis.add(i.tool_emoji)
+                    bot_emojis.add(i.skip_emoji)
+                for emoji in bot_emojis:
+                    if emoji and first_text.startswith(emoji):
+                        logger.info(
+                            f"OneBot {inst.name}: ignoring bot-generated message "
+                            f"(starts with {emoji}), user={user_id}"
+                        )
+                        return
 
         # Check @ mention requirement for group messages
         if message_type == "group":
@@ -966,37 +1229,45 @@ class OneBotChannel(BaseChannel):
                 group_id, inst.require_mention
             )
             
-            if require_mention:
-                # Determine which QQ ID to check for @ mention
-                # Priority: inst.qq_id > inst.self_id > message self_id
-                check_qq_id = inst.qq_id or inst.self_id or self_id
-                
-                # Extract @ mentions from message
-                at_qq_list = self._extract_at_mentions(message)
-                
-                # Log for debugging
+            # Determine which QQ ID to check for @ mention
+            # Priority: inst.qq_id > inst.self_id > message self_id
+            check_qq_id = inst.qq_id or inst.self_id or self_id
+            
+            # Extract @ mentions from message
+            at_qq_list = self._extract_at_mentions(message)
+            
+            # Log for debugging
+            logger.info(
+                f"OneBot {inst.name}: @ mention check, "
+                f"group={group_id}, check_qq={check_qq_id}, at_list={at_qq_list}, "
+                f"policy={'group_override' if group_id in inst.group_mention_policy else 'default'}"
+            )
+            
+            # Rule 1: If message has @ mentions but bot is NOT among them, ignore
+            # This applies regardless of require_mention setting
+            if at_qq_list and check_qq_id and check_qq_id not in at_qq_list:
                 logger.info(
-                    f"OneBot {inst.name}: @ mention check, "
-                    f"group={group_id}, check_qq={check_qq_id}, at_list={at_qq_list}, "
-                    f"policy={'group_override' if group_id in inst.group_mention_policy else 'default'}"
+                    f"OneBot {inst.name}: ignoring group message (@ others, not me), "
+                    f"group={group_id}, my_qq={check_qq_id}, at_list={at_qq_list}"
                 )
-                
-                # Check if bot was mentioned
-                if check_qq_id and check_qq_id not in at_qq_list:
-                    logger.info(
-                        f"OneBot {inst.name}: ignoring group message (no @ mention), "
-                        f"group={group_id}, expected_qq={check_qq_id}, at_list={at_qq_list}"
-                    )
-                    return
-                
-                # If qq_id unknown, still require @ mention check with message self_id
-                if not check_qq_id:
-                    logger.warning(
-                        f"OneBot {inst.name}: cannot check @ mention (qq_id unknown), "
-                        f"set qq_id in config or wait for get_login_info response. "
-                        f"Ignoring message."
-                    )
-                    return
+                return
+            
+            # Rule 2: If no @ mentions and require_mention is True, ignore
+            if not at_qq_list and require_mention:
+                logger.info(
+                    f"OneBot {inst.name}: ignoring group message (no @ mention), "
+                    f"group={group_id}, require_mention=True"
+                )
+                return
+            
+            # Rule 3: If qq_id unknown and there are @ mentions, we can't verify
+            if at_qq_list and not check_qq_id:
+                logger.warning(
+                    f"OneBot {inst.name}: cannot verify @ mention (qq_id unknown), "
+                    f"set qq_id in config or wait for get_login_info response. "
+                    f"Ignoring message."
+                )
+                return
 
         # Parse message content
         content_parts = await self._parse_message_content(message)
@@ -1121,6 +1392,35 @@ class OneBotChannel(BaseChannel):
                         
         return at_list
 
+    def _extract_first_text(self, message: Any) -> str:
+        """Extract first text content from OneBot message array.
+        
+        Args:
+            message: OneBot message array
+            
+        Returns:
+            First text string found, or empty string
+        """
+        if isinstance(message, str):
+            return message
+            
+        if not isinstance(message, list):
+            return ""
+            
+        for seg in message:
+            if not isinstance(seg, dict):
+                continue
+                
+            seg_type = seg.get("type", "")
+            data = seg.get("data", {})
+            
+            if seg_type == "text":
+                text = data.get("text", "")
+                if text:
+                    return text
+                    
+        return ""
+
     async def send(
         self,
         to_handle: str,
@@ -1133,13 +1433,19 @@ class OneBotChannel(BaseChannel):
 
         # Parse to_handle
         parsed = self._parse_to_handle(to_handle)
-        instance_name = parsed.get("instance", "default")
+        bot_qq = parsed.get("instance", "default")  # Actually bot QQ number
         message_type = parsed.get("message_type", "private")
         target_id = parsed.get("target_id", 0)
 
-        inst = self._instances.get(instance_name)
+        # Find instance by bot QQ number
+        inst = None
+        for i in self._instances.values():
+            if str(i.self_id) == bot_qq or i.name == bot_qq:
+                inst = i
+                break
+
         if not inst or not inst.ws or inst.ws.closed:
-            logger.warning(f"OneBot instance {instance_name} not connected")
+            logger.warning(f"OneBot instance {bot_qq} not connected")
             return
 
         # Build API call
@@ -1156,9 +1462,9 @@ class OneBotChannel(BaseChannel):
                 "params": params,
                 "echo": f"send_{int(time.time() * 1000)}"
             })
-            logger.debug(f"OneBot {instance_name} sent to {to_handle}")
+            logger.debug(f"OneBot {inst.name} sent to {to_handle}")
         except Exception as e:
-            logger.error(f"OneBot {instance_name} send failed: {e}")
+            logger.error(f"OneBot {inst.name} send failed: {e}")
 
     def _parse_to_handle(self, to_handle: str) -> Dict[str, Any]:
         """Parse to_handle string to components."""

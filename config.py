@@ -31,6 +31,19 @@ class OneBotInstanceConfig(BaseModel):
         default=True,
         description="Whether bot must be @ mentioned in group messages (default: True)",
     )
+    # Instance-specific emoji overrides (optional, use top-level if not set)
+    thinking_emoji: Optional[str] = Field(
+        default=None,
+        description="Override thinking emoji for this instance",
+    )
+    tool_emoji: Optional[str] = Field(
+        default=None,
+        description="Override tool emoji for this instance",
+    )
+    skip_emoji: Optional[str] = Field(
+        default=None,
+        description="Override skip emoji for this instance",
+    )
 
 
 class OneBotRoutingRule(BaseModel):
@@ -172,4 +185,17 @@ class OneBotChannelConfig(BaseModel):
     output_options: Optional[OutputOptions] = Field(
         default=None,
         description="Output options for message rendering (reply, thinking, tool calls)",
+    )
+    # Top-level emoji config (can be overridden per-instance)
+    thinking_emoji: str = Field(
+        default="🤔",
+        description="Emoji to mark thinking/reasoning content",
+    )
+    tool_emoji: str = Field(
+        default="📝",
+        description="Emoji to mark tool call content",
+    )
+    skip_emoji: str = Field(
+        default="💤",
+        description="Emoji to mark skipped/meaningless content",
     )

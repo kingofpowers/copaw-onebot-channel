@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.5.0] - 2026-03-18
+
+### Added
+
+- **顶层 Emoji 配置**
+  - `thinking_emoji`: 思考/推理内容标记（默认 🤔）
+  - `tool_emoji`: 工具调用/结果标记（默认 📝）
+  - `skip_emoji`: 无意义内容标记（默认 💤）
+  - 支持实例级别覆盖
+
+- **Bot 消息过滤**
+  - 自动过滤自己发送的消息
+  - 自动过滤带 emoji 前缀的消息（防止循环）
+
+### Fixed
+
+- **TextContent 处理**
+  - `_prepend_emoji_to_event` 正确处理 `TextContent` 对象（之前只处理 dict）
+
+- **Emoji 标记逻辑**
+  - `show_thinking=True` 时正确添加 emoji 并显示内容
+
+### Configuration Example
+
+```json
+{
+  "channels": {
+    "onebot": {
+      "thinking_emoji": "🤔",
+      "tool_emoji": "📝",
+      "skip_emoji": "💤",
+      "instances": [{
+        "name": "napcat",
+        "thinking_emoji": "💭",  // 实例级别覆盖
+        "tool_emoji": "🔧"
+      }]
+    }
+  }
+}
+```
+
 ## [0.4.2] - 2026-03-17
 
 ### Fixed
